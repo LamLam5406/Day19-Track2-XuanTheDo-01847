@@ -16,6 +16,7 @@
 
 # %%
 import _setup  # noqa: F401
+import statistics
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -147,9 +148,16 @@ print(f"Single lookup: {single_latency_ms:.2f}ms")
 print({k: v[0] for k, v in features.items()})
 
 # %% [markdown]
-# ## 5. TODO — Batch latency benchmark (100 lookups, P99)
+# ## 5. Batch latency benchmark (100 lookups, P99)
 
 # %%
+# Warm SQLite pages and Feast metadata before measuring steady-state serving.
+for i in range(10):
+    fs.get_online_features(
+        features=REQUEST_FEATURES,
+        entity_rows=[{"user_id": f"u_{i:03d}"}],
+    ).to_dict()
+
 latencies: list[float] = []
 for i in range(100):
     user_id = f"u_{i:03d}"
@@ -161,9 +169,10 @@ for i in range(100):
     latencies.append((time.perf_counter() - t0) * 1000)
 
 latencies.sort()
-p50 = latencies[50]
-p95 = latencies[95]
-p99 = latencies[99]
+p50, p95, p99 = (
+    statistics.quantiles(latencies, n=100, method="inclusive")[p - 1]
+    for p in (50, 95, 99)
+)
 print(f"Online lookup latency over 100 calls:")
 print(f"  P50 = {p50:.2f}ms")
 print(f"  P95 = {p95:.2f}ms")
@@ -185,7 +194,9 @@ else:
 import pandas as pd
 entity_df = pd.DataFrame({
     "user_id": ["u_001", "u_002", "u_003"],
-    "event_timestamp": [NOW - timedelta(hours=2), NOW - timedelta(hours=1), NOW],
+    # Every entity timestamp is on/after that user's generated profile event,
+    # so the PIT result contains all three requested rows.
+    "event_timestamp": [NOW, NOW, NOW],
 })
 
 historical = fs.get_historical_features(

@@ -77,7 +77,14 @@ class Embedder:
         p = self.spec.provider
         if p == "fastembed":
             from fastembed import TextEmbedding
-            self._impl = TextEmbedding(model_name=self.spec.model)
+            # ONNX Runtime otherwise uses every visible logical CPU. In
+            # containers/CI that can massively oversubscribe a small CPU quota
+            # (minutes instead of seconds for this 1,000-document corpus).
+            # Keep the default deterministic while allowing local tuning.
+            threads = int(os.getenv("FASTEMBED_THREADS", "2"))
+            if threads < 1:
+                raise ValueError("FASTEMBED_THREADS must be a positive integer")
+            self._impl = TextEmbedding(model_name=self.spec.model, threads=threads)
         elif p == "sentence-transformers":
             try:
                 from sentence_transformers import SentenceTransformer

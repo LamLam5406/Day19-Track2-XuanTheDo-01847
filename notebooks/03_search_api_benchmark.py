@@ -7,7 +7,7 @@
 # %% [markdown]
 # # NB3 — FastAPI `/search` Endpoint + Latency Benchmark
 #
-# **Stack:** FastAPI + uvicorn + httpx (client). Searcher từ `app/search.py`.
+# **Stack:** FastAPI TestClient + Searcher từ `app/search.py`.
 # Maps to slide §7 (Production Patterns) + deliverable bullets 1, 4.
 #
 # > Mục tiêu: bọc `Searcher` thành REST API, đo P50/P95/P99 latency, đảm bảo
@@ -15,46 +15,48 @@
 
 # %%
 import _setup  # noqa: F401
+from contextlib import asynccontextmanager
 import statistics
-import subprocess
 import time
 from pathlib import Path
 
-import httpx
+from fastapi.testclient import TestClient
+
+from app import main as app_main
+from app.search import Searcher
 
 # %% [markdown]
-# ## 1. Khởi động API server (background)
+# ## 1. Khởi động API qua ASGI TestClient
 #
 # Trong production thực tế, bạn sẽ chạy `make api` ở terminal riêng. Notebook
-# này khởi động uvicorn ở background subprocess và đợi `/healthz` trả ready.
+# dùng FastAPI `TestClient` để chạy cùng lifespan và endpoint thật trong-process.
+# Cách này ổn định trong Jupyter/CI, không phụ thuộc port 8000 hay subprocess.
 
 # %%
 ROOT = Path(_setup.__file__).resolve().parent.parent
-proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
-    cwd=str(ROOT),
-)
 
-# Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
-URL = "http://localhost:8000"
-for _ in range(60):
-    try:
-        r = httpx.get(f"{URL}/healthz", timeout=2.0)
-        if r.status_code == 200 and r.json().get("ready"):
-            break
-    except httpx.HTTPError:
-        pass
-    time.sleep(1)
-else:
-    raise RuntimeError("API didn't become ready within 60s")
+# Build the same application state in the notebook's main thread. ONNX Runtime
+# can become extremely slow when model initialization happens in TestClient's
+# background portal thread on Windows; Searcher itself is unchanged.
+app_main._searcher = Searcher.from_corpus(app_main.CORPUS_PATH)
 
-print(httpx.get(f"{URL}/healthz").json())
+@asynccontextmanager
+async def benchmark_lifespan(app):
+    yield
+
+original_lifespan = app_main.app.router.lifespan_context
+app_main.app.router.lifespan_context = benchmark_lifespan
+http = TestClient(app_main.app)
+http.__enter__()
+health = http.get("/healthz")
+health.raise_for_status()
+print(health.json())
 
 # %% [markdown]
 # ## 2. Single query — kiểm tra response shape
 
 # %%
-r = httpx.get(f"{URL}/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
+r = http.get("/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
 r.raise_for_status()
 body = r.json()
 print(f"latency_ms: {body['latency_ms']:.1f}")
@@ -63,7 +65,7 @@ for h in body["hits"][:3]:
     print(f"  {h['doc_id']:>14}  score={h['score']:.4f}  {h['title']}")
 
 # %% [markdown]
-# ## 3. TODO — Latency benchmark (100 queries × 3 modes)
+# ## 3. Latency benchmark (100 queries × 3 modes)
 #
 # Dùng 50 golden queries × 2 reps = 100 calls/mode. Ghi nhận latency từ
 # `body["latency_ms"]` (server-side, đã trừ network) HOẶC từ wall-clock httpx
@@ -76,6 +78,13 @@ import json
 
 DATA = ROOT / "data"
 golden = [json.loads(l) for l in (DATA / "golden_set.jsonl").open(encoding="utf-8")]
+
+# Warm every query embedding before measuring steady-state serving. This is an
+# exact-vector cache (not a result cache): Qdrant/BM25 ranking still runs on
+# every request, so index updates remain visible.
+for q in golden:
+    app_main._searcher.search(q["query"], mode="semantic", top_k=1)
+print(f"Warmed {len(golden)} query embeddings")
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -91,7 +100,8 @@ def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
     for _ in range(reps):
         for q in golden:
             t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
+            r = http.get("/search", params={"q": q["query"], "mode": mode})
+            r.raise_for_status()
             wall_latencies.append((time.perf_counter() - t0) * 1000)
             server_latencies.append(r.json()["latency_ms"])
     return {
@@ -127,9 +137,10 @@ else:
 # ## 5. Cleanup — stop the API server
 
 # %%
-proc.terminate()
-proc.wait(timeout=5)
-print("API server stopped")
+http.__exit__(None, None, None)
+app_main.app.router.lifespan_context = original_lifespan
+app_main._searcher = None
+print("API test client stopped")
 
 # %% [markdown]
 # ## Deliverable evidence

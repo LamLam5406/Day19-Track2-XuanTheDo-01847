@@ -24,7 +24,7 @@ def main() -> int:
         # ── 1. fastembed ────────────────────────────────────────────────
         step("fastembed loads + embeds (BAAI/bge-small-en-v1.5)")
         from fastembed import TextEmbedding
-        emb_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+        emb_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", threads=2)
         sample = list(emb_model.embed(["cloud computing tiếng Việt"]))
         assert len(sample) == 1 and len(sample[0]) == 384, f"unexpected vector shape: {len(sample[0])}"
 
